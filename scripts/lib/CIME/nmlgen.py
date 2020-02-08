@@ -24,7 +24,7 @@ _var_ref_re = re.compile(r"\$(\{)?(?P<name>\w+)(?(1)\})")
 
 _ymd_re = re.compile(r"%(?P<digits>[1-9][0-9]*)?y(?P<month>m(?P<day>d)?)?")
 
-_stream_file_template = """<?xml version="1.0"?>
+_stream_mct_file_template = """<?xml version="1.0"?>
 <file id="stream" version="1.0">
 <dataSource>
    GENERIC
@@ -57,6 +57,27 @@ _stream_file_template = """<?xml version="1.0"?>
 </file>
 """
 
+_stream_nuopc_file_template = """<?xml version="1.0"?>
+ <?xml version="1.0"?>
+ <file id="stream" version="1.0">
+   <stream_domainfile>
+      {domain_filename}
+   </stream_domainfile>
+   <stream_variableNames>
+      {data_varnames}
+   </stream_variableNames>
+   <stream_filePath>
+      {data_filepath}
+   </stream_filePath>
+   <stream_fileNames>
+      {data_filenames}
+   </stream_fileNames>
+   <stream_offset>
+      {offset}
+   </stream_offset>
+ </stream_info>
+"""
+
 class NamelistGenerator(object):
 
     """Utility class for generating namelists for a given component."""
@@ -76,7 +97,7 @@ class NamelistGenerator(object):
         # Save off important information from inputs.
         self._case = case
         self._din_loc_root = case.get_value('DIN_LOC_ROOT')
-
+        self._driver = case.get_value("COMP_INTERFACE")
         # Create definition object - this will validate the xml schema in the definition file
         self._definition = NamelistDefinition(definition_files[0], files=files)
 
@@ -269,6 +290,8 @@ class NamelistGenerator(object):
             match = _var_ref_re.search(scalar)
             while match:
                 env_val = self._case.get_value(match.group('name'))
+                if env_val is None and self._driver == 'nuopc':
+                    break
                 expect(env_val is not None,
                        "Namelist default for variable {} refers to unknown XML variable {}.".format(name, match.group('name')))
                 scalar = scalar.replace(match.group(0), str(env_val), 1)
@@ -417,7 +440,8 @@ class NamelistGenerator(object):
         return "\n".join(new_lines)
 
     def create_stream_file_and_update_shr_strdata_nml(self, config, caseroot, #pylint:disable=too-many-locals
-                           stream, stream_path, data_list_path):
+                                                      stream, stream_path, data_list_path, use_nuopc=False):
+
         """Write the pseudo-XML file corresponding to a given stream.
 
         Arguments:
@@ -438,76 +462,140 @@ class NamelistGenerator(object):
         config = config.copy()
         config["stream"] = stream
 
-
-        # Stream-specific configuration.
-        if os.path.exists(user_stream_path):
-            safe_copy(user_stream_path, stream_path)
-            strmobj = Stream(infile=stream_path)
-            domain_filepath = strmobj.get_value("domainInfo/filePath")
-            data_filepath = strmobj.get_value("fieldInfo/filePath")
-            domain_filenames = strmobj.get_value("domainInfo/fileNames")
-            data_filenames = strmobj.get_value("fieldInfo/fileNames")
-        else:
-            # Figure out the details of this stream.
-            if stream in ("prescribed", "copyall"):
-                # Assume only one file for prescribed mode!
-                grid_file = self.get_default("strm_grid_file", config)
-                domain_filepath, domain_filenames = os.path.split(grid_file)
-                data_file = self.get_default("strm_data_file", config)
-                data_filepath, data_filenames = os.path.split(data_file)
+        # Stream-specific configuration - NUOPC
+        if use_nuopc:
+            if os.path.exists(user_stream_path):
+                # user stream file is specified - use an already created stream txt file
+                safe_copy(user_stream_path, stream_path)
+                strmobj = Stream(infile=stream_path)
+                stream_domain_filename = strmobj.get_value("stream_domainfile")
+                stream_data_filepath = strmobj.get_value("stream_filePath")
+                stream_data_filenames = strmobj.get_value("stream_fileNames")
             else:
-                domain_filepath = self.get_default("strm_domdir", config)
-                domain_filenames = self.get_default("strm_domfil", config)
-                data_filepath = self.get_default("strm_datdir", config)
-                data_filenames = self.get_default("strm_datfil", config)
+                # user stream file is not specified - create a stream txt file
+                # parse namelist_default_<dmodel>.xml
+                if stream in ("prescribed", "copyall"):
+                    # Assume only one file for prescribed mode!
+                    stream_domain_filename = self.get_default("strm_mesh", config)
+                    stream_data_filepath = self.get_default("strm_data_files", config)
+                    stream_data_filepath, stream_data_filenames = os.path.split(data_file)
+                else:
+                    stream_domain_filename = self.get_default("strm_mesh", config)
+                    stream_data_filepath = self.get_default("strm_data_dir", config)
+                    stream_data_filenames = self.get_default("strm_data_files", config)
 
-            domain_varnames = self._sub_fields(self.get_default("strm_domvar", config))
-            data_varnames = self._sub_fields(self.get_default("strm_datvar", config))
-            offset = self.get_default("strm_offset", config)
-            year_start = int(self.get_default("strm_year_start", config))
-            year_end = int(self.get_default("strm_year_end", config))
-            data_filenames = self._sub_paths(data_filenames, year_start, year_end)
-            domain_filenames = self._sub_paths(domain_filenames, year_start, year_end)
+                # determine data_filenames - first set year_start, year_end and offset as input
+                # to creating data_filenames
+                year_start = int(self.get_default("strm_year_start", config))
+                year_end = int(self.get_default("strm_year_end", config))
+                stream_data_filenames = self._sub_paths(stream_data_filenames, year_start, year_end)
 
-            # Overwrite domain_file if should be set from stream data
-            if domain_filenames == 'null':
-                domain_filepath = data_filepath
-                domain_filenames = data_filenames.splitlines()[0]
+                # determine stream data variable names
+                stream_data_varnames = self._sub_fields(self.get_default("strm_datvar", config))
 
-            stream_file_text = _stream_file_template.format(
-                domain_varnames=domain_varnames,
-                domain_filepath=domain_filepath,
-                domain_filenames=domain_filenames,
-                data_varnames=data_varnames,
-                data_filepath=data_filepath,
-                data_filenames=data_filenames,
-                offset=offset,
-            )
+                # determine stream time offset
+                stream_offset = self.get_default("strm_offset", config)
 
-            with open(stream_path, 'w') as stream_file:
-                stream_file.write(stream_file_text)
+                # create stream txt file
+                stream_file_text = _stream_nuopc_file_template.format(
+                    domain_filename=stream_stream_domain_filename, 
+                    data_varnames=stream_data_varnames,
+                    data_filepath=stream_data_filepath, 
+                    data_filenames=stream_data_filenames,
+                    offset=stream_offset)
+                with open(stream_path, 'w') as stream_file:
+                    stream_file.write(stream_file_text)
 
-        lines_hash = self._get_input_file_hash(data_list_path)
-        with open(data_list_path, 'a') as input_data_list:
-            for i, filename in enumerate(domain_filenames.split("\n")):
-                if filename.strip() == '':
-                    continue
-                filepath, filename = os.path.split(filename)
-                if not filepath:
-                    filepath = os.path.join(domain_filepath, os.path.dirname(filename.strip()))
-                string = "domain{:d} = {}\n".format(i+1, filepath)
+            # add entries to input data list
+            lines_hash = self._get_input_file_hash(data_list_path)
+            with open(data_list_path, 'a') as input_data_list:
+                string = "mesh = {}\n".format(stream_mesh_filename)
                 hashValue = hashlib.md5(string.rstrip().encode('utf-8')).hexdigest()
                 if hashValue not in lines_hash:
                     input_data_list.write(string)
-            for i, filename in enumerate(data_filenames.split("\n")):
-                if filename.strip() == '':
-                    continue
-                filepath = os.path.join(data_filepath, filename.strip())
-                string = "file{:d} = {}\n".format(i+1, filepath)
-                hashValue = hashlib.md5(string.rstrip().encode('utf-8')).hexdigest()
-                if hashValue not in lines_hash:
-                    input_data_list.write(string)
-        self.update_shr_strdata_nml(config, stream, stream_path)
+                for i, filename in enumerate(stream_data_filenames.split("\n")):
+                    if filename.strip() == '':
+                        continue
+                    filepath = os.path.join(stream_data_filepath, filename.strip())
+                    string = "file{:d} = {}\n".format(i+1, filepath)
+                    hashValue = hashlib.md5(string.rstrip().encode('utf-8')).hexdigest()
+                    if hashValue not in lines_hash:
+                        input_data_list.write(string)
+
+            self.update_shr_strdata_nml(config, stream, stream_path)
+
+        # Stream-specific configuration - MCT
+        if not use_nuopc:
+            if os.path.exists(user_stream_path):
+                # user stream file is specified - use an already created stream txt file
+                safe_copy(user_stream_path, stream_path)
+                strmobj = Stream(infile=stream_path)
+                domain_filepath = strmobj.get_value("domainInfo/filePath")
+                data_filepath = strmobj.get_value("fieldInfo/filePath")
+                domain_filenames = strmobj.get_value("domainInfo/fileNames")
+                data_filenames = strmobj.get_value("fieldInfo/fileNames")
+            else:
+                # user stream file is not specified - create a stream txt file
+                # parse namelist_default_<dmodel>.xml
+                if stream in ("prescribed", "copyall"):
+                    # Assume only one file for prescribed mode!
+                    grid_file = self.get_default("strm_grid_file", config)
+                    domain_filepath, domain_filenames = os.path.split(grid_file)
+                    data_file = self.get_default("strm_data_file", config)
+                    data_filepath, data_filenames = os.path.split(data_file)
+                else:
+                    domain_filepath = self.get_default("strm_domdir", config)
+                    domain_filenames = self.get_default("strm_domfil", config)
+                    data_filepath = self.get_default("strm_datdir", config)
+                    data_filenames = self.get_default("strm_datfil", config)
+
+                domain_varnames = self._sub_fields(self.get_default("strm_domvar", config))
+                data_varnames = self._sub_fields(self.get_default("strm_datvar", config))
+                offset = self.get_default("strm_offset", config)
+                year_start = int(self.get_default("strm_year_start", config))
+                year_end = int(self.get_default("strm_year_end", config))
+                data_filenames = self._sub_paths(data_filenames, year_start, year_end)
+                domain_filenames = self._sub_paths(domain_filenames, year_start, year_end)
+
+                # Overwrite domain_file if should be set from stream data
+                if domain_filenames == 'null':
+                    domain_filepath = data_filepath
+                    domain_filenames = data_filenames.splitlines()[0]
+
+                stream_file_text = _stream_mct_file_template.format(
+                    domain_varnames=domain_varnames,
+                    domain_filepath=domain_filepath,
+                    domain_filenames=domain_filenames,
+                    data_varnames=data_varnames,
+                    data_filepath=data_filepath,
+                    data_filenames=data_filenames,
+                    offset=offset,
+                )
+
+                with open(stream_path, 'w') as stream_file:
+                    stream_file.write(stream_file_text)
+
+            lines_hash = self._get_input_file_hash(data_list_path)
+            with open(data_list_path, 'a') as input_data_list:
+                for i, filename in enumerate(domain_filenames.split("\n")):
+                    if filename.strip() == '':
+                        continue
+                    filepath, filename = os.path.split(filename)
+                    if not filepath:
+                        filepath = os.path.join(domain_filepath, os.path.dirname(filename.strip()))
+                    string = "domain{:d} = {}\n".format(i+1, filepath)
+                    hashValue = hashlib.md5(string.rstrip().encode('utf-8')).hexdigest()
+                    if hashValue not in lines_hash:
+                        input_data_list.write(string)
+                for i, filename in enumerate(data_filenames.split("\n")):
+                    if filename.strip() == '':
+                        continue
+                    filepath = os.path.join(data_filepath, filename.strip())
+                    string = "file{:d} = {}\n".format(i+1, filepath)
+                    hashValue = hashlib.md5(string.rstrip().encode('utf-8')).hexdigest()
+                    if hashValue not in lines_hash:
+                        input_data_list.write(string)
+            self.update_shr_strdata_nml(config, stream, stream_path)
 
     def update_shr_strdata_nml(self, config, stream, stream_path):
         """Updates values for the `shr_strdata_nml` namelist group.
