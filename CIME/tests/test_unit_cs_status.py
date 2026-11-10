@@ -67,6 +67,26 @@ class TestCsStatus(CustomAssertionsTestStatus):
         with test_status.TestStatus(test_dir=test_dir_path, test_name=test_name) as ts:
             ts.set_status(phase, status)
 
+    def write_expected_fails_file(self, test_name, phases):
+        """Writes an expected fails file listing a FAIL for each of the given
+        phases of test_name; returns the path to the file"""
+        phase_xml = "".join(
+            '    <phase name="{}">\n      <status>{}</status>\n    </phase>\n'.format(
+                phase, test_status.TEST_FAIL_STATUS
+            )
+            for phase in phases
+        )
+        contents = (
+            '<?xml version= "1.0"?>\n<expectedFails version="1.1">\n'
+            '  <test name="{}">\n{}  </test>\n</expectedFails>\n'.format(
+                test_name, phase_xml
+            )
+        )
+        filepath = os.path.join(self._testroot, "ExpectedFails.xml")
+        with open(filepath, "w") as expected_fails_file:
+            expected_fails_file.write(contents)
+        return filepath
+
     # ------------------------------------------------------------------------
     # Begin actual tests
     # ------------------------------------------------------------------------
@@ -295,6 +315,65 @@ class TestCsStatus(CustomAssertionsTestStatus):
         # Make sure that no other phases are mistakenly labeled as expected failures:
         self.assert_num_expected_unexpected_fails(
             self._output.getvalue(), num_expected=1, num_unexpected=0
+        )
+        # The overall status of test1 should be EXPECTED FAILURE, but test2 should
+        # still be FAIL:
+        self.assertRegex(
+            self._output.getvalue(),
+            r"{} \(Overall: EXPECTED FAILURE\)".format(re.escape(test_name1)),
+        )
+        self.assertRegex(
+            self._output.getvalue(),
+            r"{} \(Overall: FAIL\)".format(re.escape(test_name2)),
+        )
+
+    def test_expected_fails_overall_with_unexpected_fail(self):
+        """If a test has an expected failure plus an unexpected failure, the
+        overall status should remain FAIL"""
+        test_name = "my.test.name"
+        test_dir_path = self.create_test_dir(test_name + ".testid")
+        self.create_test_status_core_passes(test_dir_path, test_name)
+        self.set_phase_to_status(
+            test_dir_path,
+            test_name,
+            phase=self._NON_CORE_PHASE,
+            status=test_status.TEST_FAIL_STATUS,
+        )
+        self.set_phase_to_status(
+            test_dir_path,
+            test_name,
+            phase=self._NON_CORE_PHASE2,
+            status=test_status.TEST_FAIL_STATUS,
+        )
+        xfail_path = self.write_expected_fails_file(test_name, [self._NON_CORE_PHASE])
+        cs_status(
+            [os.path.join(test_dir_path, "TestStatus")],
+            expected_fails_filepath=xfail_path,
+            out=self._output,
+        )
+        self.assertRegex(
+            self._output.getvalue(),
+            r"{} \(Overall: FAIL\)".format(re.escape(test_name)),
+        )
+        self.assertNotRegex(self._output.getvalue(), r"Overall: EXPECTED FAILURE")
+
+    def test_expected_fails_overall_summary(self):
+        """With the summary flag, a test whose only failures are expected
+        should be reported as EXPECTED FAILURE"""
+        test_name = "my.test.name"
+        test_dir_path = self.create_test_dir(test_name + ".testid")
+        self.create_test_status_core_passes(test_dir_path, test_name)
+        fail_phase = self.set_last_core_phase_to_fail(test_dir_path, test_name)
+        xfail_path = self.write_expected_fails_file(test_name, [fail_phase])
+        cs_status(
+            [os.path.join(test_dir_path, "TestStatus")],
+            summary=True,
+            expected_fails_filepath=xfail_path,
+            out=self._output,
+        )
+        self.assertRegex(
+            self._output.getvalue(),
+            r"EXPECTED FAILURE {}".format(re.escape(test_name)),
         )
 
 

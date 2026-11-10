@@ -6,7 +6,14 @@ of the tests in one or more test suites
 from __future__ import print_function
 from CIME.XML.standard_module_setup import *
 from CIME.XML.expected_fails_file import ExpectedFailsFile
-from CIME.test_status import TestStatus, SHAREDLIB_BUILD_PHASE, TEST_PEND_STATUS
+from CIME.expected_fails import EXPECTED_FAILURE_COMMENT
+from CIME.test_status import (
+    TestStatus,
+    SHAREDLIB_BUILD_PHASE,
+    TEST_PASS_STATUS,
+    TEST_PEND_STATUS,
+    TEST_FAIL_STATUS,
+)
 import os
 import sys
 from collections import defaultdict
@@ -41,7 +48,9 @@ def cs_status(
 
     If expected_fails_filepath is provided, it should be a string giving
     the full path to a file listing expected failures for this test
-    suite. Expected failures are then labeled as such in the output.
+    suite. Expected failures are then labeled as such in the output. In
+    addition, if every FAILed phase of a test is an expected failure, then
+    the test's overall status is reported as "EXPECTED FAILURE".
     """
     expect(not (summary and fails_only), "Cannot have both summary and fails_only")
     expect(
@@ -63,9 +72,14 @@ def cs_status(
                 ts.set_status(SHAREDLIB_BUILD_PHASE, TEST_PEND_STATUS)
 
         test_id = os.path.basename(test_dir).split(".")[-1]
+        test_xfails = xfails.get(ts.get_name())
         if summary:
             output = _overall_output(
-                ts, "  {status} {test_name}\n", check_throughput, check_memory
+                ts,
+                "  {status} {test_name}\n",
+                check_throughput,
+                check_memory,
+                xfails=test_xfails,
             )
         else:
             if fails_only:
@@ -76,12 +90,13 @@ def cs_status(
                     "  {test_name} (Overall: {status}) details:\n",
                     check_throughput,
                     check_memory,
+                    xfails=test_xfails,
                 )
             output += ts.phase_statuses_dump(
                 prefix="    ",
                 skip_passes=fails_only,
                 skip_phase_list=count_fails_phase_list,
-                xfails=xfails.get(ts.get_name()),
+                xfails=test_xfails,
             )
             if count_fails_phase_list:
                 ts.increment_non_pass_counts(non_pass_counts)
@@ -120,17 +135,42 @@ def _get_xfails(expected_fails_filepath):
     return xfails
 
 
-def _overall_output(ts, format_str, check_throughput, check_memory):
+def _overall_output(ts, format_str, check_throughput, check_memory, xfails=None):
     """Returns a string giving the overall test status
 
     Args:
     ts: TestStatus object
     format_str (string): string giving the format of the output; must
         contain place-holders for status and test_name
+    xfails: ExpectedFails object for this test, or None. If the test did
+        not pass, and every FAILed phase is listed as an expected failure,
+        then the overall status is reported as "EXPECTED FAILURE".
     """
     test_name = ts.get_name()
     status = ts.get_overall_test_status(
         check_throughput=check_throughput,
         check_memory=check_memory,
     )[0]
+    if (
+        xfails is not None
+        and status not in (TEST_PASS_STATUS, TEST_PEND_STATUS)
+        and _all_fails_expected(ts, xfails)
+    ):
+        status = "EXPECTED FAILURE"
     return format_str.format(status=status, test_name=test_name)
+
+
+def _all_fails_expected(ts, xfails):
+    """Returns True if ts has at least one FAILed phase, and every FAILed
+    phase is listed in xfails (an ExpectedFails object) with a FAIL status.
+
+    Note that this is conservative: a FAIL in a phase that does not affect
+    the overall status (e.g., TPUTCOMP by default) but that is not listed as
+    an expected failure still causes this to return False.
+    """
+    failed_phases = [phase for phase, status in ts if status == TEST_FAIL_STATUS]
+    return bool(failed_phases) and all(
+        xfails.expected_fails_comment(phase, TEST_FAIL_STATUS)
+        == EXPECTED_FAILURE_COMMENT
+        for phase in failed_phases
+    )
